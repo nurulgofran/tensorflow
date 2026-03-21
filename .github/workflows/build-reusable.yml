@@ -1,0 +1,158 @@
+# Copyright 2024 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+name: Reusable Build
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Which runner should the workflow run on?'
+        required: true
+        type: string
+      tfci:
+        description: 'TFCI environment variable'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    if: contains(github.event.pull_request.body, 'WIP')
+    runs-on: ${{ inputs.runner }}
+    defaults:
+      run:
+        shell: bash
+    container: ${{ (contains(inputs.runner, 'linux-x86') && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest') ||
+                   (contains(inputs.runner, 'linux-arm64') && 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-arm64:latest') ||
+                   (contains(inputs.runner, 'windows-x86') && null) }}
+    timeout-minutes: 300
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # ratchet:actions/checkout@v4
+        env:
+          GIT_CONFIG_PARAMETERS: "'checkout.workers=12' 'core.featureManyFiles=true'"
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+        
+      - name: Setup Clang and MSVC environment
+        if: ${{ contains(inputs.runner, 'windows-x86') }}
+        # JAX handles Clang on Windows by relying on standard paths and environment variables.
+        # We find the local installation of MSVC and LLVM and set the necessary environment variables
+        # for Bazel's discovery mechanism (cc_configure).
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $VS_PATH = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          if ($LASTEXITCODE -ne 0) { throw "vswhere failed with exit code $LASTEXITCODE" }
+          
+          $VS_MSVC_DIR = Get-ChildItem -Directory -Path "$VS_PATH\VC\Tools\MSVC" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object FullName
+          if (-not $VS_MSVC_DIR) { throw "Could not find MSVC directory in $VS_PATH\VC\Tools\MSVC" }
+
+          # Find the root of LLVM installation that contains bin\clang-cl.exe
+          # 1. Search in Visual Studio's bundled LLVM
+          # 2. Search in common standalone installation paths
+          # 3. Use 'where.exe' to find it in PATH
+          $SEARCH_PATHS = @(
+            "$VS_PATH\VC\Tools\Llvm",
+            "C:\Program Files\LLVM",
+            "C:\Program Files (x86)\LLVM",
+            "C:\tools\LLVM"
+          )
+          
+          $CLANG_CL_EXE = $null
+          foreach ($SEARCH_PATH in $SEARCH_PATHS) {
+            if (Test-Path $SEARCH_PATH) {
+              Write-Output "Searching for clang-cl.exe in $SEARCH_PATH..."
+              $CLANG_CL_EXE = Get-ChildItem -Path $SEARCH_PATH -Recurse -Filter "clang-cl.exe" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch "ARM64" } | Sort-Object FullName -Descending | Select-Object -First 1
+              if ($CLANG_CL_EXE) { break }
+            }
+          }
+          
+          if (-Not $CLANG_CL_EXE) {
+            Write-Output "Not found in common paths, searching system PATH..."
+            $WHERE_CLANG = where.exe clang-cl 2>$null | Select-Object -First 1
+            if ($WHERE_CLANG) {
+               $CLANG_CL_EXE = Get-Item $WHERE_CLANG
+            }
+          }
+
+          if (-Not $CLANG_CL_EXE) {
+            throw "ERROR: clang-cl.exe not found in any of: $SEARCH_PATHS or in PATH!"
+          }
+
+          $CLANG_CL_PATH = $CLANG_CL_EXE.FullName.Replace('\', '/')
+          $VS_LLVM_DIR = (Split-Path (Split-Path $CLANG_CL_PATH -Parent) -Parent).Replace('\', '/')
+          $VS_MSVC_DIR = $VS_MSVC_DIR.Replace('\', '/')
+
+          Write-Output "Found MSVC: $VS_MSVC_DIR"
+          Write-Output "Found LLVM: $VS_LLVM_DIR"
+          Write-Output "Clang-cl path: $CLANG_CL_PATH"
+
+          # Write to .bazelrc.user to avoid space parsing issues on the command line.
+          # We use double quotes for values to handle spaces correctly.
+          # We use forward slashes to avoid backslash escape issues in Bazel RC files.
+          $bazelrc_user = ".bazelrc.user"
+          
+          # Try to find a valid BAZEL_SH path
+          $BAZEL_SH = "C:/Program Files/Git/bin/bash.exe"
+          if (-not (Test-Path $BAZEL_SH)) {
+             $BAZEL_SH = "C:/tools/msys64/usr/bin/bash.exe"
+          }
+
+          $config_lines = @(
+            "build --repo_env=BAZEL_VC=""$VS_MSVC_DIR""",
+            "build --repo_env=BAZEL_LLVM=""$VS_LLVM_DIR""",
+            "build --repo_env=CLANG_COMPILER_PATH=""$CLANG_CL_PATH""",
+            "build --repo_env=USE_CLANG_CL=1",
+            "build --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0",
+            "build --repo_env=CC=""$CLANG_CL_PATH""",
+            "build --repo_env=CXX=""$CLANG_CL_PATH""",
+            "build --repo_env=BAZEL_SH=""$BAZEL_SH"""
+          )
+          
+          # Using .NET methods to ensure UTF-8 without BOM for GitHub Actions runner compatibility
+          # Join-Path or Get-Location can return objects; using "$pwd\..." ensures a string path.
+          [System.IO.File]::WriteAllText("$pwd\$bazelrc_user", ($config_lines -join "`r`n") + "`r`n")
+          
+          # Also set them in GITHUB_ENV and GITHUB_PATH for any other steps
+          $env_vars = @(
+            "TFCI_BAZEL_VC=$VS_MSVC_DIR",
+            "TFCI_BAZEL_LLVM=$VS_LLVM_DIR",
+            "TFCI_USE_CLANG_CL=1",
+            "BAZEL_VC=$VS_MSVC_DIR",
+            "BAZEL_LLVM=$VS_LLVM_DIR",
+            "USE_CLANG_CL=1",
+            "CC=$CLANG_CL_PATH",
+            "CXX=$CLANG_CL_PATH"
+          )
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, ($env_vars -join "`r`n") + "`r`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_PATH, "$VS_LLVM_DIR\bin`r`n")
+          
+          Write-Output "Environment configured in $bazelrc_user, GITHUB_ENV, and GITHUB_PATH"
+          Get-Content $bazelrc_user
+          
+          # Explicitly set exit code to 0 to avoid "ghost" failures from previous non-terminating errors
+          $global:LASTEXITCODE = 0
+        shell: powershell
+
+      - name: Build and test
+        env:
+          TFCI: ${{ inputs.tfci }}
+          TFCI_GITHUB_ACTIONS: true
+        run: echo WIP present; ./ci/official/pycpp.sh
